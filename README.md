@@ -2,10 +2,10 @@
 
 #### To run the code:
 1. Run preprocess_notebook.ipynb
-    - Extract raw images
-    - Preprocess raw images 
-    - Split in to training, test and validation sets
-    - Format the processed data for genki scripts
+    - Extracts raw images
+    - Preprocesses raw images 
+    - Splits data into training, test and validation sets
+    - Formats the processed data for genki scripts
 2. Run genki_pre.py and genki_eval.py
 3. Visualize results by running visualize_results.ipynb
 
