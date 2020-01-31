@@ -1,6 +1,6 @@
 # Information Density Information for the LIDC-IDRI Dataset
 
-#### To run the code:
+#### How to use:
 1. Run preprocess_notebook.ipynb
     - Extracts raw images
     - Preprocesses raw images 
