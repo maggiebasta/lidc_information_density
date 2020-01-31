@@ -3,38 +3,47 @@ import pickle
 import shutil
 import sys
 
+import numpy as np
 import pandas as pd
 import pydicom
+from PIL import Image, ImageEnhance
 from skimage.io import imsave, imread
 from sklearn.model_selection import train_test_split
 
-from lidc_helpers import (
+from helpers import (
     find_ct_path,
-    get_patient_df,
-    get_series_uid
+    get_patient_table,
+    get_nodule_mask,
+    get_series_uid,
+    get_lung_mask,
+    normalize,
+    resize
 )
 
-sys.path.append("../")
-import preprocess_helpers
 
-
-def extract(raw_path, prepped_path, extract_all=True, start=None, end=None):
+def extract(sourcepath='data/raw/', destpath='data/extracted', k=4):
     """
-    Given path to raw data and an output path, extracts desired slices from
-    sraw LIDC-IDRI images and saves them
+    Given path to raw data and an output path, extracts and saves the
+    2D slices and labels from the raw LIDC-IDRI data
 
-    :param raw_path: path to raw data to prepare
-    :param prepped_path: path to directory to save prepared data
-    :param extract_all: whether or not to extract from all raw data image sets
-    :param start: if extract_all is false, which image set to start extraction
-    :param end: if extract_all is false, which image set to end extraction
+    :param sourcepath: path to raw data
+    :param destpath: path to directory to save extracted data
+    :param k: the max number of non-tumor and tumor slices to take from
+              each patient (2k total slices from each patient)
     :return: None
     """
-    if extract_all:
-        start = 1
-        end = len(os.listdir(f"{raw_path}/LIDC-IDRI/"))
-    elif start is None or end is None:
-        raise ValueError("must specify start and end if extract_all is false")
+
+    # construct directory for extracted files
+    os.mkdir(f"{destpath}")
+    os.mkdir(f"{destpath}/image")
+    os.mkdir(f"{destpath}/mask")
+    os.mkdir(f"{destpath}/label")
+
+    # tracks which images belong to which patient (for later test/train split)
+    ImgLookup = {}
+
+    start = 1
+    end = len(os.listdir(f"{sourcepath}/LIDC-IDRI/"))
 
     id_nums = [
         '0'*(4-len(n))+n for n in [str(i) for i in range(start, end+1)]
@@ -46,16 +55,17 @@ def extract(raw_path, prepped_path, extract_all=True, start=None, end=None):
         sys.stdout.flush()
         # check if patient in LUMA
         uids = pickle.load(open("uids.pkl", "rb"))
-        if not os.path.exists(raw_path + patient_id):
+        if not os.path.exists(sourcepath + patient_id):
             continue
-        if get_series_uid(find_ct_path(raw_path, patient_id)) not in uids:
+        if get_series_uid(find_ct_path(sourcepath, patient_id)) not in uids:
             continue
-        # get image and contours for patient images, keep LARGEST countor only
-        pid_df = get_patient_df(raw_path, patient_id)
+        ImgLookup[patient_id] = []
+        # get image and contours for patient images
+        slices_table = get_patient_table(sourcepath, patient_id, k=k)
         images = []
         masks = []
         labels = []
-        for row in pid_df.iterrows():
+        for row in slices_table.iterrows():
             path, rois = row[1].path, row[1].ROIs
             try:
                 if pd.isna(rois):
@@ -63,58 +73,60 @@ def extract(raw_path, prepped_path, extract_all=True, start=None, end=None):
             except ValueError:
                 labels.append(True)
             im = pydicom.dcmread(path).pixel_array
-            masks.append(preprocess_helpers.get_nodule_mask(im, rois))
+            masks.append(get_nodule_mask(im, rois))
             images.append(im)
 
         # save prepared image and mask in properly constructed directory
-        while True:
-            try:
-                for im, mask, label in zip(images, masks, labels):
-                    idx = len(os.listdir(f"{prepped_path}/image/"))
-                    imsave(f"{prepped_path}/image/{idx}.tif", im)
-                    imsave(f"{prepped_path}/mask/{idx}.tif", mask)
-                    pickle.dump(label, open(f"{prepped_path}/label/{idx}.pkl", 'wb'))
-
-            except FileNotFoundError:
-                os.mkdir(f"{prepped_path}")
-                os.mkdir(f"{prepped_path}/image")
-                os.mkdir(f"{prepped_path}/mask")
-                os.mkdir(f"{prepped_path}/label")
-                continue
-            break
+        for im, mask, label in zip(images, masks, labels):
+            idx = len(os.listdir(f"{destpath}/image/"))
+            imsave(f"{destpath}/image/{idx}.tif", im)
+            imsave(f"{destpath}/mask/{idx}.tif", mask)
+            pickle.dump(label, open(f"{destpath}/label/{idx}.pkl", 'wb'))
+            ImgLookup[patient_id].append(idx)
+    pickle.dump(ImgLookup, open(f"data/ImageLookup.pkl", 'wb'))
 
 
-def preprocess(datapath, processedpath):
-    os.mkdir(processedpath)
-    os.mkdir(f"{processedpath}/image")
-    os.mkdir(f"{processedpath}/mask")
-    os.mkdir(f"{processedpath}/label")
+def preprocess(sourcepath='data/extracted', destpath='data/processed'):
+    os.mkdir(destpath)
+    os.mkdir(f"{destpath}/image")
+    os.mkdir(f"{destpath}/mask")
+    os.mkdir(f"{destpath}/label")
 
-    idxs = range(len(os.listdir(f"{datapath}/image/")))
+    idxs = range(len(os.listdir(f"{sourcepath}/image/")))
     n = len(idxs)
     for i, idx in enumerate(idxs):
         sys.stdout.write(f"\rProcessing...{i+1}/{n}")
         sys.stdout.flush()
-        img = imread(f"{datapath}/image/{idx}.tif")
-        mask = preprocess_helpers.resize(
-            preprocess_helpers.get_lung_mask(img).astype('float')
+        img = imread(f"{sourcepath}/image/{idx}.tif")
+        lung_mask = resize(
+            get_lung_mask(img).astype('float')
         )
-        img = preprocess_helpers.normalize(img)
-        img = preprocess_helpers.resize(img)
-        img = img*mask
-        imsave(f"{processedpath}/image/{idx}.tif", img)
+        img = normalize(img)
+        img = resize(img)
+        img = img*lung_mask
+        img = img*lung_mask
+        pil_im = Image.fromarray(img)
+        enhancer = ImageEnhance.Contrast(pil_im)
+        enhanced_im = enhancer.enhance(2.0)
+        np_im = np.array(enhanced_im)
+        imsave(f"{destpath}/image/{idx}.tif", np_im)
 
-        mask = imread(f"{datapath}/mask/{idx}.tif")
-        mask = preprocess_helpers.resize(mask)
-        imsave(f"{processedpath}/mask/{idx}.tif", mask)
+        mask = imread(f"{sourcepath}/mask/{idx}.tif")
+        mask = resize(mask)
+        imsave(f"{destpath}/mask/{idx}.tif", mask)
 
-        lbl_source = f"{datapath}/label/{idx}.pkl"
-        lbl_dest = f"{processedpath}/label/{i}.pkl"
+        lbl_source = f"{sourcepath}/label/{idx}.pkl"
+        lbl_dest = f"{destpath}/label/{i}.pkl"
         shutil.copyfile(lbl_source, lbl_dest)
     print(f"\nComplete.")
 
 
-def test_train_split(datapath, trainpath, testpath):
+def test_train_split(
+    sourcepath='data/processed',
+    trainpath='data/train',
+    testpath='data/test',
+    valpath='data/val'
+):
     """
     Called from download_transform_split. Creates training and test sets from
     prepared images
@@ -122,46 +134,75 @@ def test_train_split(datapath, trainpath, testpath):
     :param datapath: the directory containing prepared, train, and test folders
     :return: None
     """
+    for d in [trainpath, testpath, valpath]:
+        os.mkdir(f"{d}")
+        os.mkdir(f"{d}/image")
+        os.mkdir(f"{d}/label")
+        os.mkdir(f"{d}/mask")
 
-    os.mkdir(trainpath)
-    os.mkdir(f"{trainpath}/image")
-    os.mkdir(f"{trainpath}/label")
-    os.mkdir(f"{trainpath}/mask")
-    os.mkdir(testpath)
-    os.mkdir(f"{testpath}/image")
-    os.mkdir(f"{testpath}/label")
-    os.mkdir(f"{testpath}/mask")
+    ImageLookup = pickle.load(open("data/ImageLookup.pkl", "rb"))
 
-    idxs = os.listdir(f"{datapath}/image/")
-    train_idxs, test_idxs = train_test_split(idxs, test_size=.2)
-    for i, idx in enumerate(train_idxs):
-        im_source = f"{datapath}/image/{idx}"
-        im_dest = f"{trainpath}/image/{i}.tif"
-        shutil.copyfile(im_source, im_dest)
+    ids = list(ImageLookup.keys())
 
-        lbl_source = f"{datapath}/label/{idx[:-4]}.pkl"
-        lbl_dest = f"{trainpath}/label/{i}.pkl"
-        shutil.copyfile(lbl_source, lbl_dest)
+    train_ids, test_ids = train_test_split(ids, test_size=.2)
+    train_ids, val_ids = train_test_split(train_ids, test_size=.1)
 
-        msk_source = f"{datapath}/mask/{idx}"
-        msk_dest = f"{trainpath}/mask/{i}.tif"
-        shutil.copy(msk_source, msk_dest)
+    count = 0
+    for id_num in train_ids:
+        idxs = [
+            i for i in ImageLookup[id_num]
+            if os.path.exists(f"{sourcepath}/image/{i}.tif")
+        ]
+        for idx in idxs:
+            im_source = f"{sourcepath}/image/{idx}.tif"
+            im_dest = f"{trainpath}/image/{count}.tif"
+            shutil.copyfile(im_source, im_dest)
 
-    for i, idx in enumerate(test_idxs):
-        im_source = f"{datapath}/image/{idx}"
-        im_dest = f"{testpath}/image/{i}.tif"
-        shutil.copyfile(im_source, im_dest)
+            lbl_source = f"{sourcepath}/label/{idx}.pkl"
+            lbl_dest = f"{trainpath}/label/{count}.pkl"
+            shutil.copyfile(lbl_source, lbl_dest)
 
-        lbl_source = f"{datapath}/label/{idx[:-4]}.pkl"
-        lbl_dest = f"{testpath}/label/{i}.pkl"
-        shutil.copyfile(lbl_source, lbl_dest)
+            msk_source = f"{sourcepath}/mask/{idx}.tif"
+            msk_dest = f"{trainpath}/mask/{count}.tif"
+            shutil.copy(msk_source, msk_dest)
+            count += 1
 
-        msk_source = f"{datapath}/mask/{idx}"
-        msk_dest = f"{testpath}/mask/{i}.tif"
-        shutil.copy(msk_source, msk_dest)
+    count = 0
+    for id_num in val_ids:
+        idxs = [
+            i for i in ImageLookup[id_num]
+            if os.path.exists(f"{sourcepath}/image/{i}.tif")
+        ]
+        for idx in idxs:
+            im_source = f"{sourcepath}/image/{idx}.tif"
+            im_dest = f"{valpath}/image/{count}.tif"
+            shutil.copyfile(im_source, im_dest)
 
+            lbl_source = f"{sourcepath}/label/{idx}.pkl"
+            lbl_dest = f"{valpath}/label/{count}.pkl"
+            shutil.copyfile(lbl_source, lbl_dest)
 
+            msk_source = f"{sourcepath}/mask/{idx}.tif"
+            msk_dest = f"{valpath}/mask/{count}.tif"
+            shutil.copy(msk_source, msk_dest)
+            count += 1
 
-if __name__ == "__main__":
-    num_patients = int(sys.argv[1])
-    download_transform_split(num_patients)
+    count = 0
+    for id_num in test_ids:
+        idxs = [
+            i for i in ImageLookup[id_num]
+            if os.path.exists(f"{sourcepath}/image/{i}.tif")
+        ]
+        for idx in idxs:
+            im_source = f"{sourcepath}/image/{idx}.tif"
+            im_dest = f"{testpath}/image/{count}.tif"
+            shutil.copyfile(im_source, im_dest)
+
+            lbl_source = f"{sourcepath}/label/{idx}.pkl"
+            lbl_dest = f"{testpath}/label/{count}.pkl"
+            shutil.copyfile(lbl_source, lbl_dest)
+
+            msk_source = f"{sourcepath}/mask/{idx}.tif"
+            msk_dest = f"{testpath}/mask/{count}.tif"
+            shutil.copy(msk_source, msk_dest)
+            count += 1
