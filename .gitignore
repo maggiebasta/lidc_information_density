@@ -3,3 +3,5 @@
 *data/train/*
 *data/test/*
 *.pkl
+*.pyc
+*.ipynb_checkpoints
