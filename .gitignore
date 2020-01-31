@@ -1,0 +1,5 @@
+*data/extracted/*
+*data/processed/*
+*data/train/*
+*data/test/*
+*.pkl
